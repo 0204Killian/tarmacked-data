@@ -1,0 +1,163 @@
+name: TestFlight
+
+# A signed App Store build of the app, uploaded to App Store Connect for
+# TestFlight. Run it by hand: Actions → TestFlight → Run workflow (pick the
+# branch of the app repo to build, normally main). Internal testers get
+# each build as soon as Apple has processed it.
+#
+# This repo is public so Mac build minutes are free. The app's code is in
+# the private repo 0204Killian/tarmacked, fetched with APP_REPO_TOKEN.
+# Logs here are public: nothing secret is printed, and the built app is
+# never attached to the run (it only goes to Apple).
+#
+# Secrets (Settings → Secrets and variables → Actions):
+#   APP_REPO_TOKEN  read-only token for 0204Killian/tarmacked (README.md)
+#   APPLE_TEAM_ID   Team ID (developer.apple.com → Membership)
+#   ASC_KEY_ID      App Store Connect API key ID
+#   ASC_ISSUER_ID   its Issuer ID
+#   ASC_KEY_P8      the contents of the AuthKey_XXXX.p8 file
+# Only runs by hand, never for pull requests, so secrets stay ours.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch (or tag) of the app repo to build'
+        default: 'main'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight
+  cancel-in-progress: true
+
+jobs:
+  testflight:
+    runs-on: macos-26
+    env:
+      TEAM: ${{ secrets.APPLE_TEAM_ID }}
+      KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: 0204Killian/tarmacked
+          token: ${{ secrets.APP_REPO_TOKEN }}
+          ref: ${{ github.event.inputs.ref || 'main' }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check the secrets are set
+        run: |
+          for v in TEAM KEY_ID ISSUER; do
+            if [ -z "${!v}" ]; then echo "Missing secret for $v (see the top of this file)"; exit 1; fi
+          done
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate native iOS project
+        run: npx expo prebuild --platform ios --no-install
+
+      # Local notifications only: we don't use push, so leave its entitlement out.
+      - name: Remove push entitlement
+        run: |
+          for f in ios/*/*.entitlements; do
+            /usr/libexec/PlistBuddy -c "Delete :aps-environment" "$f" 2>/dev/null || true
+          done
+
+      # Carries on above the build numbers used from the app repo (runs 1–999).
+      - name: Build number
+        run: /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $((1000 + ${{ github.run_number }}))" ios/tarmacked/Info.plist
+
+      - name: Install CocoaPods
+        run: cd ios && pod install
+
+      # The key as a proper PEM file, however it was pasted: with Windows
+      # line endings, all on one line, without the BEGIN/END lines, or the
+      # whole file base64-encoded.
+      - name: API key
+        env:
+          P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          python3 - <<'PY'
+          import base64, os, re
+          raw = os.environ.get('P8', '').replace('\r', '').strip()
+          if 'BEGIN' not in raw:
+              try:
+                  dec = base64.b64decode(re.sub(r'\s+', '', raw), validate=True).decode()
+                  if 'BEGIN' in dec:
+                      raw = dec
+              except Exception:
+                  pass
+          body = re.sub(r'-----(BEGIN|END)[^-]*-----', '', raw)
+          body = re.sub(r'[^A-Za-z0-9+/=]', '', body)
+          if len(body) < 100:
+              raise SystemExit('ASC_KEY_P8 looks empty or cut short: paste the whole .p8 file into the secret')
+          lines = [body[i:i + 64] for i in range(0, len(body), 64)]
+          pem = '-----BEGIN PRIVATE KEY-----\n' + '\n'.join(lines) + '\n-----END PRIVATE KEY-----\n'
+          open(os.path.join(os.environ['RUNNER_TEMP'], 'AuthKey.p8'), 'w').write(pem)
+          print(f'key ready ({len(body)} characters)')
+          PY
+
+      - name: Archive
+        run: |
+          xcodebuild \
+            -workspace ios/tarmacked.xcworkspace \
+            -scheme tarmacked \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/tarmacked.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER" \
+            DEVELOPMENT_TEAM="$TEAM" \
+            CODE_SIGN_STYLE=Automatic \
+            archive
+
+      - name: Export the IPA
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>teamID</key><string>$TEAM</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/tarmacked.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER"
+
+      # Apple's upload tool: it says plainly what's wrong (wrong bundle ID,
+      # build number already used, missing app record...).
+      - name: Upload to App Store Connect
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          cp "$RUNNER_TEMP/AuthKey.p8" ~/.appstoreconnect/private_keys/AuthKey_$KEY_ID.p8
+          IPA=$(ls "$RUNNER_TEMP"/export/*.ipa | head -1)
+          BUNDLE=$(node -p "require('./app.json').expo.ios.bundleIdentifier")
+          echo "Uploading $IPA, bundle ID $BUNDLE: it must match the app in App Store Connect"
+          xcrun altool --upload-app -f "$IPA" -t ios --apiKey "$KEY_ID" --apiIssuer "$ISSUER" --output-format normal
+          rm -f ~/.appstoreconnect/private_keys/AuthKey_$KEY_ID.p8
+
+      - name: Remove the key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/AuthKey.p8"
