@@ -1,4 +1,5 @@
 name: TestFlight
+run-name: "TestFlight: ${{ inputs.ref }}"
 
 # A signed App Store build of the app, uploaded to App Store Connect for
 # TestFlight. Run it by hand: Actions → TestFlight → Run workflow (pick the

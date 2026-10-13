@@ -1,4 +1,5 @@
 name: Road data
+run-name: "Road data: ${{ inputs.regions || 'all regions (monthly)' }}"
 
 # Rebuilds the road data from OpenStreetMap and puts it on
 # tiles.tarmacked.com: every region on the 2nd of each month (Geofabrik's
