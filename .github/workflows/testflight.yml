@@ -62,6 +62,13 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      # Stops the build here (about 2 minutes in) if a test fails, instead of
+      # shipping it. The type-check only reports for now (TYPECHECK=warn).
+      # Branches from before test/ci.sh existed build as they always did.
+      - name: Tests and type-check
+        run: |
+          if [ -f test/ci.sh ]; then bash test/ci.sh; else echo "no test/ci.sh on this branch: checks skipped"; fi
+
       - name: Generate native iOS project
         run: npx expo prebuild --platform ios --no-install
 
