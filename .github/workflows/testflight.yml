@@ -116,7 +116,7 @@ jobs:
         run: |
           python3 -m pip install --quiet --break-system-packages 'pyjwt[crypto]' 2>/dev/null || python3 -m pip install --quiet 'pyjwt[crypto]'
           python3 - <<'PY'
-          import json, os, time, urllib.request, jwt
+          import json, os, time, urllib.request, urllib.error, jwt
           key = open(os.path.join(os.environ['RUNNER_TEMP'], 'AuthKey.p8')).read()
           now = int(time.time())
           token = jwt.encode({'iss': os.environ['ISSUER'], 'iat': now, 'exp': now + 600, 'aud': 'appstoreconnect-v1'},
@@ -130,10 +130,21 @@ jobs:
           for c in certs:
               a = c['attributes']
               print(f"{a['certificateType']:<20} {a.get('displayName') or a.get('name')}  expires {a.get('expirationDate', '')[:10]}")
-          dev = [c for c in certs if c['attributes']['certificateType'] in ('DEVELOPMENT', 'IOS_DEVELOPMENT')]
+          # Only the throwaway ones the builds made ("Created via API"), never a person's own.
+          dev = [c for c in certs if c['attributes']['certificateType'] in ('DEVELOPMENT', 'IOS_DEVELOPMENT')
+                 and (c['attributes'].get('displayName') or c['attributes'].get('name') or '') == 'Created via API']
+          done = 0
           for c in dev:
-              call('DELETE', f"https://api.appstoreconnect.apple.com/v1/certificates/{c['id']}")
-          print(f'revoked {len(dev)} development certificate(s); kept {len(certs) - len(dev)} other(s)')
+              try:
+                  call('DELETE', f"https://api.appstoreconnect.apple.com/v1/certificates/{c['id']}")
+                  done += 1
+              except urllib.error.HTTPError as e:
+                  if e.code == 403:
+                      print('Not allowed to revoke certificates with this API key (it needs the Admin role).')
+                      print('Revoke the "Created via API" development certificates by hand: developer.apple.com > Certificates.')
+                      break
+                  raise
+          print(f'revoked {done} of {len(dev)} throwaway development certificate(s)')
           PY
 
       - name: Archive
