@@ -106,6 +106,36 @@ jobs:
           print(f'key ready ({len(body)} characters)')
           PY
 
+      # Every cloud build makes a throwaway "Apple Development" certificate
+      # (its key dies with the runner), and Apple allows only a few, so after
+      # a few dozen builds signing fails ("reached the maximum number of
+      # certificates"). Revoke the old development ones first. Distribution
+      # certificates are never touched; apps already out are unaffected.
+      - name: Clear old development certificates
+        continue-on-error: true
+        run: |
+          python3 -m pip install --quiet --break-system-packages 'pyjwt[crypto]' 2>/dev/null || python3 -m pip install --quiet 'pyjwt[crypto]'
+          python3 - <<'PY'
+          import json, os, time, urllib.request, jwt
+          key = open(os.path.join(os.environ['RUNNER_TEMP'], 'AuthKey.p8')).read()
+          now = int(time.time())
+          token = jwt.encode({'iss': os.environ['ISSUER'], 'iat': now, 'exp': now + 600, 'aud': 'appstoreconnect-v1'},
+                             key, algorithm='ES256', headers={'kid': os.environ['KEY_ID'], 'typ': 'JWT'})
+          def call(method, url):
+              req = urllib.request.Request(url, method=method, headers={'Authorization': f'Bearer {token}'})
+              with urllib.request.urlopen(req) as r:
+                  body = r.read()
+                  return json.loads(body) if body else None
+          certs = call('GET', 'https://api.appstoreconnect.apple.com/v1/certificates?limit=200&fields[certificates]=certificateType,displayName,name,expirationDate')['data']
+          for c in certs:
+              a = c['attributes']
+              print(f"{a['certificateType']:<20} {a.get('displayName') or a.get('name')}  expires {a.get('expirationDate', '')[:10]}")
+          dev = [c for c in certs if c['attributes']['certificateType'] in ('DEVELOPMENT', 'IOS_DEVELOPMENT')]
+          for c in dev:
+              call('DELETE', f"https://api.appstoreconnect.apple.com/v1/certificates/{c['id']}")
+          print(f'revoked {len(dev)} development certificate(s); kept {len(certs) - len(dev)} other(s)')
+          PY
+
       - name: Archive
         run: |
           xcodebuild \
